@@ -35,13 +35,13 @@ then
         $BASEDIR/buildscripts/deps-packaging/apache/httpd-ssl.conf
 fi
 
-#
 # Override for manual testing
-#
 if [ "x$1" != x ]
 then
     DEPS="$@"
 fi
+
+output_dir=`mktempdir /tmp/deps.XXXXXX`
 
 for dep in $DEPS
 do
@@ -74,31 +74,39 @@ do
     revision=$(cat $BASEDIR/buildscripts/deps-packaging/revision)
     version=0+$revision$versuffix$crossver
 
-    if pkg-cache find $dep-$version
+    # CD into an empty directory
+    cd $output_dir
+    [ "x`ls`" = x ]  ||  \
+        fatal "Cache output directory was not empty: $output_dir: `ls`"
+
+    # FETCH dependency packages
+    pkg-cache-sftp get $dep-$version                            # TODO pkg-cache (not SFTP)
+    package_files=`ls`
+
+    # If package cache did not have the packages
+    if [ x"$package_files" = x ]
     then
-        if [ x$PKGCACHE_PRUNE != x ]
-        then
-            echo "Removing package from cache because PKGCACHE_PRUNE is set"
-            pkg-cache prune $dep-$version
-        else
-            echo "Package found in cache, skipping compilation"
-        fi
-
-    fi
-
-    # Keep 10 packages around. Should be more than enough for all the main
-    # and private branches.
-    pkg-cache autoprune $dep 10
-
-    if pkg-cache find $dep-$version
-    then
-        :
-    else
-        $BASEDIR/buildscripts/deps-packaging/pkg-build-${DEP_PACKAGING}  \
+        # BUILD the packages
+        $BASEDIR/buildscripts/deps-packaging/pkg-build-$DEP_PACKAGING  \
             $dep $tests $cross $optimize $debugsym $version
-        pkg-cache store $dep-$version $(pkg-find-${DEP_PACKAGING} $BASEDIR/$dep)
+
+        package_files=`pkg-find-$DEP_PACKAGING $BASEDIR/$dep`
+
+        [ x"$package_files" = x ]  &&  \
+            fatal "Empty output dir after building dependency: $dep"
+
+        # CACHE them
+        pkg-cache-sftp store $dep-$version $package_files
     fi
 
-    install_pkg_files  $(pkg-cache list $dep-$version)
+    # INSTALL the packages
+    install_pkg_files  $package_files
+
+    # CLEAN UP
+    rm -f $package_files
+    cd -
 
 done
+
+
+rmdir $output_dir

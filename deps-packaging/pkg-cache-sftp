@@ -1,0 +1,165 @@
+#!/bin/sh
+
+. `dirname "$0"`/../build-scripts/functions
+set +e                                                   # errors are OK
+set -x
+
+# TODO KEEP THE OLD VERSION OF LOCAL CACHE FOR WHOEVER DOES NOT WANT REMOTE CACHE
+# TODO store the files in a local directory, if the file exists locally don't sftp-get it
+
+
+# Check for Jenkins node label and use that as index.
+# There can be multiple labels, pick the first one.
+firstlabel=${NODE_LABELS%% *}
+
+if [ x"$firstlabel" = x ]
+then
+    echo "Jenkins has not assigned a LABEL to this node, you are probably building manually" 1>&2
+    firstlabel=NO_LABEL
+    CHECK_ONLY_LOCAL=1
+    # TODO THIS SHOULD DO LOCAL CACHE
+fi
+
+
+#CACHE_HOST=deppkgs@build-artifacts-cache.cloud.cfengine.com
+CACHE_HOST=jenkins_sftp_cache@build-artifacts-cache.cloud.cfengine.com
+CACHEDIR="deps_pkg_cache/$firstlabel"
+SSH_ARGS="-o GSSAPIAuthentication=no -o PreferredAuthentications=publickey"
+
+
+# TODO cache this test result in /tmp
+sftp -b - user@localhost  </dev/null  2>&1  \
+    |  fgrep 'No such file or directory (-)'  >/dev/null
+
+if [ $? = 0 ]                                     # old version detected
+then
+    echo "This host has a very old SFTP client, taking countermeasures ..."
+    SFTP_IS_OLD=1
+else
+    SFTP_IS_OLD=0
+fi
+
+
+# Feed the SFTP command with an sftp commands script in standard
+# input. Any command that fails will cause sftp to return error, unless
+# that command is prefixed with '-'.
+#
+# However old SFTP versions are very restrictive: "-b" switch does not
+# accept '-' to indicate stdin, script commands can't be prefixed with
+# '-' and the return code of sftp is always zero even if some of the
+# script commands failed.
+sftp_stdin()
+{
+    if [ $SFTP_IS_OLD = 1 ]
+    then
+        # Remove leading dash from input script
+        sed 's/^-//'  \
+            | sftp $SSH_ARGS  $CACHE_HOST  \
+            | grep -v '^sftp>'
+        return 0                  # can't detect errors anyway
+    else
+        sftp $SSH_ARGS -b -  $CACHE_HOST
+        return
+    fi
+}
+
+
+print_usage()
+{
+    (
+    exec >&2
+    echo
+    echo "$0 get      <pkg>-<version>-<release>"
+    echo "  Fetches all packages related to the version requested, writes them to CWD"
+    echo
+    echo "$0 store    <pkg>-<version>-<release> <pkgfile> [<pkgfile> ...]"
+    echo "  Stores new package in cache. refuses to do that if package already exists"
+    echo
+    )
+}
+
+
+retval=73                                           # failure by default
+
+CMD=$1
+shift
+
+case "$CMD" in
+get)
+    depname=$1
+    if [ x$depname = x ]  ||  [ x"$2" != x ]
+    then
+        fatal  "$0 get:  requires exactly one word as argument: depname"
+    fi
+
+    tmpdir=`mktempdir pkg-cache-sftp.get.$depname.XXXX`
+    if cd $tmpdir
+    then
+
+        echo "
+            cd $CACHEDIR/$depname
+            get * .DONE
+            "  |  sftp_stdin
+        retval=$?
+
+        # Is the download complete and are the files stored properly on the server?
+        if [ $retval = 0 ]  &&  [ -f .DONE ]  &&  [ `ls | wc -l` -gt 0 ]
+        then                                                        # success
+            mv * .DONE  ../
+            retval=$?                             # 0 for success most likely
+        else
+            rm -f * .DONE
+            # Any failure is considered "successful lookup but failed to
+            # find package in cache". It's hard to do otherwise.
+            retval=0
+        fi
+
+        cd ..
+    fi
+    ;;
+store)
+    depname=$1
+    shift
+    depfiles="$@"
+    [ x"$depfiles" = x ]  &&  \
+        fatal  "$0 store:  requires at least 2 args: depname depfiles..."
+
+    tmpdir=`mktempdir pkg-cache-sftp.store.$depname.XXXXXXXX`
+    touch $tmpdir/.DONE
+
+    # Prefixing the sftp line with '-' causes the sftp script to
+    # not abort on error.
+    # + mkdir will usually fail unless it's a brand new jenkins label.
+    # + rename will fail if another buildslave
+    #   managed to upload the package first.
+
+    echo "
+        -mkdir $CACHEDIR
+        cd $CACHEDIR
+        mkdir $tmpdir
+        cd    $tmpdir
+        `echo $depfiles | xargs -n1 echo put`
+        put $tmpdir/.DONE
+        cd ..
+        -rename $tmpdir $depname
+        "  |  sftp_stdin
+
+    retval=$?
+    rm $tmpdir/.DONE
+    ;;
+*)
+    print_usage
+    retval=2
+    ;;
+esac
+
+
+# CLEAN-UP and EXIT
+
+if [ x"$tmpdir" != x ]  &&  [ -d "$tmpdir" ]
+then
+    # No need for `rm -rf`, tmpdir should already be empty
+    rmdir "$tmpdir"
+fi
+
+exit $retval
