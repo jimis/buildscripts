@@ -53,7 +53,7 @@ sftp_stdin()
     if [ $SFTP_IS_OLD = 1 ]
     then
         # Remove leading dash from input script
-        sed 's/^-//'  \
+        sed 's/^ *-//'  \
             | sftp $SSH_ARGS  $CACHE_HOST  \
             | grep -v '^sftp>'
         return 0                  # can't detect errors anyway
